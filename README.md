@@ -1,6 +1,6 @@
-## Model Evaluation
+# Model Evaluation
 
-#### Anomalib DSR (Deep Spatial Representation) Model
+### Anomalib DSR (Deep Spatial Representation) Model
 *(Unsupervised Model Training)*
 Quantized-feature based algorithm that consists of an autoencoder with one encoder and two decoders, coupled with an anomaly detection module. DSR learns a codebook of quantized representations on ImageNet, which are then used to encode input images
 ![DSR Architecture](assets/images/dsr.png)
@@ -10,14 +10,14 @@ Quantized-feature based algorithm that consists of an autoencoder with one encod
  3) Detect Anomalies By Comparing Reconstructed & Original Images
 
 
-#### Dataset
+### Dataset
 **MIIC (Microscopic Images of Integrated Circuits)**
 Contains a large-scale dataset real microscopic images of integrated circuits (ICs) obtained by Scanning Electron Microscopy (SEM). The SEM images are taken at the metal layer of a manufactured IC and are in gray-scale with a dimension of 512x512 pixels. For each image containing anomalies, a bounding box and pixel-wise ground truth mask is provided.
 
 [github link](https://github.com/wenbihan/MIIC-IAD)
 
 
-#### Training Configuration
+### Training Configuration
 
 - **Training Type:** Unsupervised (normal samples only)
 - **Input Resolution:** 256 × 256 (upsampled to 512 × 512 during visualization)
@@ -31,7 +31,7 @@ Contains a large-scale dataset real microscopic images of integrated circuits (I
 - **Epochs:** 20
 
 
-#### Model Post Prediction Processing
+### Model Post Prediction Processing
 
 **Min-Max Normalization Of Anomaly Map**
 - Lowest pixel intensity value becomes exactly 0.0
@@ -49,7 +49,7 @@ Apply binary mask on original image to flag out anomalous regions
 
 ---
 
-## File Structure
+# File Structure
 ```bash
 ENCODER-DECODER/
 ├── .venv/                 # virtual environment files
