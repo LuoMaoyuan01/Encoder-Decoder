@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Data / outputs
+data/
+output/
+pre_trained/
+*.rar
+
+# Model weights and large artifacts
+weights/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.npz
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (adjust if you keep tokens here)
+*.env
+*.secret
+config.local.yaml
