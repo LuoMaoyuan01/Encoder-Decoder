@@ -56,8 +56,16 @@ ENCODER-DECODER/
 │   └── ...                
 ├── assets/                # images, architecture diagrams, etc.
 │   └── ...                
-├── data/                  # training and testing datasets
-│   └── ...                
+├── data/                  # training, testing and validation datasets
+│   └── configA/           # Contains images in a specific configuration
+│   └── test/
+│       └── normal/ 
+│       └── anomalous/             
+│   └── val/
+│       └── normal/ 
+│       └── anomalous/    
+│   └── train/
+│       └── normal/    
 ├── output/                # model predictions, evaluation outputs
 │   └── ...                
 ├── pre_trained/           # pretrained weights or checkpoints

@@ -14,10 +14,12 @@ venv/
 # Data / outputs
 data/
 output/
+results/
 pre_trained/
 *.rar
 
 # Model weights and large artifacts
+checkpoints/
 weights/
 *.ckpt
 *.pt
@@ -37,3 +39,7 @@ Thumbs.db
 *.env
 *.secret
 config.local.yaml
+
+# MISC
+*.rar
+*.zip
