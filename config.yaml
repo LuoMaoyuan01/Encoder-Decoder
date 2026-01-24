@@ -1,7 +1,7 @@
-model : "weights/dsr_large_sample_epoch=20.ckpt"
-test_path : data/original/test/normal2
+model : "weights/dsr_semicon_epoch=53"
+test_path : data/test/normal2
 test_output_path : output/test/normal
-training_path : data/original/train/normal
+training_path : data/train/normal
 training_output_path : output/training
 checkpoint_path : checkpoints
 epochs : 60

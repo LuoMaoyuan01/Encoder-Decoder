@@ -23,11 +23,6 @@ BATCH_SIZE = cfg.get("batch_size", 6)
 LEARNING_RATE = cfg.get("learning_rate", 0.0001)
 IMAGE_SIZE = cfg.get("image_size", 512)
 
-# ---- Ensure GPU Used When Available ----
-if torch.cuda.is_available():
-    torch.cuda.set_device(0)  # Set to the first GPU if available
-    torch.backends.cudnn.benchmark = True
-
 
 # ---------------- DATAMODULE ----------------
 # Keep transforms simple (no normalization) to satisfy DSR requirements.
@@ -43,6 +38,7 @@ dm = Folder(
     test_split_mode=TestSplitMode.FROM_DIR,
     val_split_mode=ValSplitMode.FROM_TEST,
     val_split_ratio=0.4,
+    num_workers=0,
 )
 
 # --------- Checkpoint callback ----------------
@@ -72,11 +68,18 @@ engine = Engine(
 
 # ---------------- RUN TRAINING ----------------
 if __name__ == "__main__":
+
     # print(torch.version.cuda)
     # print(torch.cuda.is_available())
     # print(torch.cuda.get_device_name(0))
 
     # Train + Validate
+    # ---- Ensure GPU Used When Available ----
+    if torch.cuda.is_available():
+        # torch.cuda.set_device(0)  # Set to the first GPU if available
+        torch.set_float32_matmul_precision("medium")
+        torch.backends.cudnn.benchmark = True
+
     engine.fit(model=model, datamodule=dm)
 
     # Evaluate best checkpoint
