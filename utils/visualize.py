@@ -1,4 +1,5 @@
 import numpy as np
+import cv2
 import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score
@@ -54,3 +55,26 @@ def obtain_best_f1(predictions):
             best_thr = thr
 
     print(f"Best threshold: {best_thr:.3f}, F1 score: {best_f1:.4f}")
+
+def plot_full_anomaly_map(full_map, title="Full Anomaly Map"):
+    """
+    full_map: torch.Tensor of shape (512, 512)
+    """
+    fm = full_map.detach().cpu().numpy()
+
+    # Normalize for visualization
+    
+    # Use Percentile normalization to reduce effect of extreme spikes
+    p = np.percentile(fm, 99.9)  # ignore extreme spikes
+    fm = np.clip(fm / p, 0, 1)
+
+    # Clean map using light spatial smoothening
+    fm = cv2.GaussianBlur(fm, (5,5), 0)
+    # fm = (fm > 0.9999).astype(float)
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(fm, cmap="jet")
+    plt.colorbar(fraction=0.046, pad=0.04)
+    plt.title(title)
+    plt.axis("off")
+    plt.show()
