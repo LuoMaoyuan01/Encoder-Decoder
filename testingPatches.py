@@ -9,7 +9,8 @@ from utils.stitch_patches import stitch_n_maps
 from utils.visualize import plot_full_anomaly_map
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CKPT_PATH = "checkpoints/last.ckpt"
+CKPT_PATH = "weights/dsr-semicon-configA_p4-epoch=149.ckpt"
+TARGET_PATCH = 256
 
 # Load model
 model = Dsr.load_from_checkpoint(CKPT_PATH)
@@ -29,7 +30,7 @@ def get_field(out, name):
 # --------- INFERENCE FUNCTION ----------
 @torch.no_grad()
 def predict_full_image(model, img_1chw):
-    patches, coords = split_into_n_patches(img_1chw, patch=128, n=4)
+    patches, coords = split_into_n_patches(img_1chw, patch=TARGET_PATCH, n=4)
     patches = patches.to(DEVICE)
 
     out = model(patches)
@@ -43,7 +44,7 @@ def predict_full_image(model, img_1chw):
     if patch_maps.shape[-1] != 128:
         patch_maps = F.interpolate(
             patch_maps.unsqueeze(1),  # (16,1,256,256)
-            size=(128, 128),
+            size=(TARGET_PATCH, TARGET_PATCH),
             mode="bilinear",
             align_corners=False
         ).squeeze(1)  # (16,128,128)
@@ -75,7 +76,7 @@ def predict_full_image(model, img_1chw):
 
 
 if __name__ == "__main__":
-    img_path = "data/temp_infer_configA/images/anomalous1.png"
+    img_path = "data/temp_infer_configA/images/train_normal_06379.jpg"
 
     transform = transforms.Compose([
         transforms.Resize((512, 512)),
@@ -88,7 +89,7 @@ if __name__ == "__main__":
     full_map, patch_maps, patch_scores, smax, stop3 = predict_full_image(model, img_tensor_1chw)
 
     # Visualize
-    plot_full_anomaly_map(full_map, title=f"Anomaly Map for {img_path}")
+    plot_full_anomaly_map(img, full_map, title=f"Anomaly Map for {img_path}")
 
     print("Patch scores:", patch_scores.tolist())
     print("Image score (max):", smax)
