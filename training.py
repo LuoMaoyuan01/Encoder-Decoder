@@ -14,7 +14,7 @@ from anomalib.models.image import Dsr
 with open("config.yaml", "r") as f:   # adjust path if config.yaml is elsewhere
     cfg = yaml.safe_load(f)
 
-DATA_ROOT = "data/configA_p4"
+DATA_ROOT = "data/configA_p4_stride50"
 TRAINING_PATH = cfg.get("training_path", "data/train/normal")  # path to the training images
 # TRAINING_OUTPUT_PATH = cfg.get("training_output_path", "output/training")  # path to save training outputs
 CHECKPOINT_PATH = cfg.get("checkpoint_path", "checkpoints")  # path to save model checkpoints
@@ -28,7 +28,7 @@ IMAGE_SIZE = cfg.get("image_size", 512)
 # ---------------- DATAMODULE ----------------
 # Keep transforms simple (no normalization) to satisfy DSR requirements.
 dm = Folder(
-    name="semicon_dsr_configA_p4",
+    name="semicon_dsr_configA_p4_stride50",
     root=DATA_ROOT,
     normal_dir="train/normal",
     normal_test_dir="test/normal",

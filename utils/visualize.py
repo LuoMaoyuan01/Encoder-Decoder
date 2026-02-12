@@ -3,6 +3,7 @@ import torch
 import cv2
 import matplotlib.pyplot as plt
 import glob, os
+import re
 from sklearn.metrics import f1_score, roc_auc_score, average_precision_score
 from collections import defaultdict
 
@@ -157,92 +158,159 @@ def _to_numpy(x):
     return np.array(x)
 
 def _unwrap_first(x):
-    if x is None: return None
-    if x.ndim == 4: return x[0]  # (B,C,H,W)->(C,H,W)
-    if x.ndim == 3 and x.shape[0] != x.shape[1] and x.shape[0] != x.shape[2]:
-        return x[0]              # (B,H,W)->(H,W)
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    if isinstance(x, np.ndarray) and x.ndim >= 1 and x.shape[0] == 1:
+        return x[0]
     return x
+
+def parse_grid_from_explanation(p):
+    """
+    expects explanation like ["g12"] or "g12"
+    returns (row, col) as ints
+    """
+    expl = fetch(p, "explanation")
+    if isinstance(expl, (list, tuple)) and len(expl) > 0:
+        expl = expl[0]
+    m = re.search(r"g(\d+)(\d+)", str(expl))
+    if not m:
+        raise ValueError(f"Cannot parse grid id from explanation={expl}. Expected like 'g12'.")
+    return int(m.group(1)), int(m.group(2))
+
+# -------------------------- WEIGHT MAP HELPER FUNCTIONS -------------------------- #
+
+def uniform_weight(patch):
+    return np.ones((patch, patch), dtype=np.float32)
+
+def linear_weight(patch):
+    """
+    Triangular / bilinear weighting.
+    Center weighted more than edges.
+    """
+    ramp = np.linspace(0, 1, patch, dtype=np.float32)
+    ramp = np.minimum(ramp, ramp[::-1])
+    w = np.outer(ramp, ramp)
+    w /= (w.max() + 1e-8)
+    return w
+
+def gaussian_weight(h: int, w: int, sigma: float = None):
+    """
+    Create a 2D gaussian weight map normalized to max=1.
+    sigma defaults to patch/4 (good starting point).
+    """
+    if sigma is None:
+        sigma = min(h, w) / 4.0
+
+    yy = np.arange(h, dtype=np.float32) - (h - 1) / 2.0
+    xx = np.arange(w, dtype=np.float32) - (w - 1) / 2.0
+    Y, X = np.meshgrid(yy, xx, indexing="ij")
+    W = np.exp(-(X**2 + Y**2) / (2.0 * sigma**2)).astype(np.float32)
+    W /= (W.max() + 1e-8)
+    return W  # (h,w), max=1
 
 # -------------------------- STITCHING HELPER FUNCTIONS -------------------------- #
 
-def stitch_4_by_order(patch_preds_4, H=512, W=512, patch=256):
-    # patch_preds_4 is length 4 in TL,TR,BL,BR order
-    # stitch image (CHW)
-    img0 = _unwrap_first(_to_numpy(fetch(patch_preds_4[0], "image")))
-    full_img = None
-    if img0 is not None:
-        if img0.ndim == 2: img0 = img0[None, ...]
-        C = img0.shape[0]
-        full_img = np.zeros((C, H, W), dtype=img0.dtype)
-        for pi, o in enumerate(patch_preds_4):
-            gy, gx = divmod(pi, 2)
-            y0, x0 = gy*patch, gx*patch
-            im = _unwrap_first(_to_numpy(fetch(o, "image")))
-            if im is None: continue
-            if im.ndim == 2: im = im[None, ...]
-            full_img[:, y0:y0+patch, x0:x0+patch] = im
+def stitch_preds(
+    preds,
+    H=512, W=512,
+    patch=256,
+    stride=128,
+    mode="gaussian",      # "uniform" | "linear" | "gaussian"
+    sigma=None,
+    stitch_pred_mask=True,
+    vote_threshold=1,   # majority vote in overlap regions
+):
+    # ---- Select blending weight ----
+    if mode == "uniform":
+        w2d = np.ones((patch, patch), dtype=np.float32)
 
-    # stitch anomaly_map (HW)
-    am0 = _unwrap_first(_to_numpy(fetch(patch_preds_4[0], "anomaly_map")))
-    full_am = None
-    if am0 is not None:
-        if am0.ndim == 3 and am0.shape[0] == 1: am0 = am0[0]
-        full_am = np.zeros((H, W), dtype=am0.dtype)
-        for pi, o in enumerate(patch_preds_4):
-            gy, gx = divmod(pi, 2)
-            y0, x0 = gy*patch, gx*patch
-            am = _unwrap_first(_to_numpy(fetch(o, "anomaly_map")))
-            if am is None: continue
-            if am.ndim == 3 and am.shape[0] == 1: am = am[0]
-            full_am[y0:y0+patch, x0:x0+patch] = am
+    elif mode == "linear":
+        ramp = np.linspace(0, 1, patch, dtype=np.float32)
+        ramp = np.minimum(ramp, ramp[::-1])
+        w2d = np.outer(ramp, ramp)
+        w2d /= (w2d.max() + 1e-8)
 
-    # stitch pred_mask (HW)
-    pm0 = _unwrap_first(_to_numpy(fetch(patch_preds_4[0], "pred_mask")))
-    full_pm = None
-    if pm0 is not None:
-        if pm0.ndim == 3 and pm0.shape[0] == 1: pm0 = pm0[0]
-        full_pm = np.zeros((H, W), dtype=pm0.dtype)
-        for pi, o in enumerate(patch_preds_4):
-            gy, gx = divmod(pi, 2)
-            y0, x0 = gy*patch, gx*patch
-            pm = _unwrap_first(_to_numpy(fetch(o, "pred_mask")))
-            if pm is None: continue
-            if pm.ndim == 3 and pm.shape[0] == 1: pm = pm[0]
-            full_pm[y0:y0+patch, x0:x0+patch] = pm
+    elif mode == "gaussian":
+        w2d = gaussian_weight(patch, patch, sigma=sigma)
 
-    # image_path: take first
-    ip = fetch(patch_preds_4[0], "image_path")
-    ip_list = ip if isinstance(ip, (list, tuple)) else [ip]
+    else:
+        raise ValueError("mode must be 'uniform', 'linear', or 'gaussian'")
 
-    # pooled score
-    scores = []
-    for o in patch_preds_4:
-        s = fetch(o, "pred_score")
-        if s is None: continue
-        if torch.is_tensor(s): s = float(s.detach().cpu())
-        scores.append(float(s))
-    pooled = max(scores) if scores else None
+    w2d_3 = w2d[None, :, :]  # for CHW images
 
-    return {"image_path": ip_list, "image": full_img, "anomaly_map": full_am, "pred_mask": full_pm, "pred_score": pooled}
-
-def stitch_preds(preds, H=512, W=512, patch=256, expected_patches=4):
     grouped = defaultdict(list)
-
     for p in preds:
-        base = get_image_path_str(p)            # real path
-        pi = get_patch_idx_from_pred(p)         # 0..3 from explanation
-        grouped[base].append((pi, p))
+        grouped[get_image_path_str(p)].append(p)
 
     stitched = []
-    for base, items in grouped.items():
-        items.sort(key=lambda t: t[0])
-        patch_list = [p for _, p in items]
 
-        if len(patch_list) != expected_patches:
-            print(f"[WARN] {base}: expected {expected_patches}, got {len(patch_list)}")
+    for base, patch_list in grouped.items():
+        img_acc = None
+        img_wgt = np.zeros((H, W), dtype=np.float32)
 
-        stitched.append(stitch_4_by_order(patch_list, H=H, W=W, patch=patch))
-        stitched[-1]["image_path"] = [base]     # keep original
+        am_acc = np.zeros((H, W), dtype=np.float32)
+        am_wgt = np.zeros((H, W), dtype=np.float32)
+
+        # pred_mask voting accumulators (optional)
+        pm_acc = np.zeros((H, W), dtype=np.float32) if stitch_pred_mask else None
+        pm_cnt = np.zeros((H, W), dtype=np.float32) if stitch_pred_mask else None
+
+        for p in patch_list:
+            r, c = parse_grid_from_explanation(p)
+            y0, x0 = r * stride, c * stride
+
+            # ---- image ----
+            im = _unwrap_first(_to_numpy(fetch(p, "image")))
+            if im is not None:
+                if im.ndim == 2:
+                    im = im[None, ...]
+                if img_acc is None:
+                    C = im.shape[0]
+                    img_acc = np.zeros((C, H, W), dtype=np.float32)
+
+                img_acc[:, y0:y0+patch, x0:x0+patch] += im.astype(np.float32) * w2d_3
+                img_wgt[y0:y0+patch, x0:x0+patch] += w2d
+
+            # ---- anomaly_map ----
+            am = _unwrap_first(_to_numpy(fetch(p, "anomaly_map")))
+            if am is not None:
+                if am.ndim == 3 and am.shape[0] == 1:
+                    am = am[0]
+                am_acc[y0:y0+patch, x0:x0+patch] += am.astype(np.float32) * w2d
+                am_wgt[y0:y0+patch, x0:x0+patch] += w2d
+
+            # ---- pred_mask (vote, not gaussian) ----
+            if stitch_pred_mask:
+                pm = _unwrap_first(_to_numpy(fetch(p, "pred_mask")))
+                if pm is not None:
+                    if pm.ndim == 3 and pm.shape[0] == 1:
+                        pm = pm[0]
+                    # vote uses counts (0/1), not gaussian weights
+                    pm_acc[y0:y0+patch, x0:x0+patch] += pm.astype(np.float32)
+                    pm_cnt[y0:y0+patch, x0:x0+patch] += 1.0
+
+        # ---- finalize ----
+        full_img = None
+        if img_acc is not None:
+            full_img = img_acc / np.clip(img_wgt[None, ...], 1e-6, None)
+
+        full_am = None
+        if am_wgt.max() > 0:
+            full_am = am_acc / np.clip(am_wgt, 1e-6, None)
+
+        full_pm = None
+        if stitch_pred_mask and pm_cnt.max() > 0:
+            pm_mean = pm_acc / np.clip(pm_cnt, 1e-6, None)
+            full_pm = (pm_mean >= vote_threshold)
+
+        stitched.append({
+            "image_path": [base],
+            "image": full_img,
+            "anomaly_map": full_am,
+            "pred_mask": full_pm,
+        })
 
     return stitched
 
@@ -278,7 +346,7 @@ def patch_score_from_anomaly_map(pred, mode="q999"):
 def pool_patch_scores(scores, pool="max"):
     """
     Pool patch scores -> one image score.
-    For localized defects: max or top2 is best.
+    For localized defects: max or topn is best.
     """
     scores = [s for s in scores if s is not None and not np.isnan(s)]
     if len(scores) == 0:
@@ -287,8 +355,9 @@ def pool_patch_scores(scores, pool="max"):
 
     if pool == "max":
         return float(scores[0])
-    if pool == "top2":
-        return float(np.mean(scores[:2])) if len(scores) >= 2 else float(scores[0])
+    if pool[0:3] == "top":
+        n = int(pool[3:])
+        return float(np.mean(scores[:n])) if len(scores) >= n else float(scores[0])
     if pool == "mean":
         return float(np.mean(scores))
     raise ValueError("pool must be one of: max, top2, mean")

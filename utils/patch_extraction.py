@@ -1,14 +1,13 @@
 import os
 import math
-from pathlib import Path
 import cv2
 from pathlib import Path
 
 SRC_ROOT = Path("data/configA")
-DST_ROOT = Path("data/configA_p4")
+DST_ROOT = Path("data/configA_p4_stride50")
 
 PATCH = 256
-STRIDE = 256  # no overlap -> 4 patches for 512x512
+STRIDE = 128 
 
 def iter_images(folder: Path):
     exts = {".png", ".jpg", ".jpeg", ".bmp"}
@@ -16,24 +15,50 @@ def iter_images(folder: Path):
         if p.suffix.lower() in exts:
             yield p
 
-def save_n_patches(src_path: Path, dst_dir: Path, n=4):
+def save_patches_stride(
+    src_path: Path,
+    dst_dir: Path,
+    patch_size: int = 256,
+    stride: int = 128,
+    require_exact_grid: bool = True,
+):
+    """
+    Saves patches using sliding window (patch_size, stride).
+    Names patches by grid location: g{row}{col}
+      - stride=256 => 2x2 => g00..g11
+      - stride=128 => 3x3 => g00..g22
+
+    If require_exact_grid=True, enforces that the grid lands exactly on the bottom/right edge.
+    """
     img = cv2.imread(str(src_path), cv2.IMREAD_GRAYSCALE)
     if img is None:
         return 0
-    h, w = img.shape
-    assert h == 512 and w == 512, f"Expected 512x512, got {h}x{w} for {src_path}"
+
+    H, W = img.shape
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    if require_exact_grid:
+        # Ensure last patch lands exactly at H-patch_size and W-patch_size
+        if (H - patch_size) % stride != 0 or (W - patch_size) % stride != 0:
+            raise ValueError(
+                f"Stride {stride} doesn't tile image {H}x{W} with patch {patch_size}. "
+                f"(H-patch)%stride={(H-patch_size)%stride}, (W-patch)%stride={(W-patch_size)%stride}"
+            )
+
+    n_rows = (H - patch_size) // stride + 1
+    n_cols = (W - patch_size) // stride + 1
 
     count = 0
-    for gy in range(int(math.sqrt(n))):
-        for gx in range(int(math.sqrt(n))):
-            y = gy * STRIDE
-            x = gx * STRIDE
-            patch = img[y:y+PATCH, x:x+PATCH]
+    for r in range(n_rows):
+        y = r * stride
+        for c in range(n_cols):
+            x = c * stride
+            patch = img[y:y+patch_size, x:x+patch_size]
 
-            out_name = f"{src_path.stem}_g{gy}{gx}{src_path.suffix}"
-            out_path = dst_dir / out_name
-            cv2.imwrite(str(out_path), patch)
+            out_name = f"{src_path.stem}_g{r}{c}{src_path.suffix}"
+            cv2.imwrite(str(dst_dir / out_name), patch)
             count += 1
+
     return count
 
 def process_split(split_rel: str):
@@ -43,7 +68,7 @@ def process_split(split_rel: str):
 
     total = 0
     for img_path in iter_images(src_dir):
-        total += save_n_patches(img_path, dst_dir, n=4)
+        total += save_patches_stride(img_path, dst_dir, patch_size=PATCH, stride=STRIDE)
 
     print(f"{split_rel}: wrote {total} patches")
 
