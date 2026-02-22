@@ -314,8 +314,8 @@ def stitch_preds(
 
     return stitched
 
-# -------------------------- SCORING HELPER FUNCTIONS -------------------------- #
-def patch_score_from_anomaly_map(pred, mode="q999"):
+# -------------------------- PATCH SCORING HELPER FUNCTIONS -------------------------- #
+def patch_score_from_anomaly_map(pred, mode="q999", method="NoOverlap"):
     """
     Robust patch score from anomaly_map.
     Use q999 instead of max if max saturates/clips.
@@ -333,11 +333,18 @@ def patch_score_from_anomaly_map(pred, mode="q999"):
         am = am[0, 0]
 
     flat = am.flatten()
+    # --- FIX 1: remove global baseline (handles "everything bright" normals), penalizes even distribution
+    if method == "Overlap":
+        flat = flat - flat.median()
+
+    # --- FIX 2 (optional but strong): suppress extreme spikes (padding/borders)
+    # cap = torch.quantile(flat, 0.99)
+    # flat = torch.clamp(flat, max=cap)
 
     if mode == "max":
         return float(flat.max().item())
-    if mode == "q999":
-        return float(torch.quantile(flat, 0.999).item())
+    if mode[0] == "q":
+        return float(torch.quantile(flat, float(mode[1:])/1000.0).item())
     if mode == "topk_mean":
         k = min(200, flat.numel())
         return float(torch.topk(flat, k).values.mean().item())
@@ -366,6 +373,7 @@ def compute_image_metrics_from_patch_preds(
     preds,
     patch_score_mode="q999",   # 'q999' recommended if max saturates
     pool="top2",               # 'max' or 'top2' recommended for 4 patches
+    method="NoOverlap",           # "NoOverlap" or "Overlap" (if patches overlap)
 ):
     # Group patches by original image path
     grouped = defaultdict(list)
@@ -377,7 +385,7 @@ def compute_image_metrics_from_patch_preds(
 
     for path, patch_list in grouped.items():
         gt = get_image_label(patch_list[0])  # image-level
-        patch_scores = [patch_score_from_anomaly_map(pp, mode=patch_score_mode) for pp in patch_list]
+        patch_scores = [patch_score_from_anomaly_map(pp, mode=patch_score_mode, method=method) for pp in patch_list]
         img_score = pool_patch_scores(patch_scores, pool=pool)
         if img_score is None:
             continue
@@ -394,5 +402,84 @@ def compute_image_metrics_from_patch_preds(
 
     auroc = roc_auc_score(y_true, y_score)
     aupr  = average_precision_score(y_true, y_score)  # positive class = 1 (anomalous)
+
+    return auroc, aupr, debug, y_true, y_score
+
+# -------------------------- MULTI SCALE SCORING HELPER FUNCTIONS -------------------------- #
+
+def image_score_from_anomaly_map(am, mode="q999"):
+    """
+    am: anomaly map (H,W) or (1,H,W) torch/numpy
+    mode:
+      - "max"
+      - "mean"
+      - "q99", "q995", "q999"
+    """
+    # torch -> numpy
+    if hasattr(am, "detach"):
+        am = am.detach().cpu().numpy()
+    else:
+        am = np.array(am)
+
+    if am.ndim == 3:   # (1,H,W)
+        am = am[0]
+    am = am.astype(np.float32)
+
+    if mode == "max":
+        return float(am.max())
+    if mode == "mean":
+        return float(am.mean())
+
+    if mode.startswith("q"):
+        q = float(mode[1:]) / 1000.0  # q999 -> 0.999
+        return float(np.quantile(am.reshape(-1), q))
+
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def compute_image_metrics_from_fused_preds(
+    fused_preds,
+    score_mode="q999",
+    label_from="gt_label",   # "gt_label" or "filename"
+    anomalous_token="anomalous",
+):
+    """
+    fused_preds: list of dicts like:
+      {'image_path':[path], 'anomaly_map': (512,512), ... , optionally 'gt_label'}
+    """
+    y_true, y_score = [], []
+    debug = {}
+
+    for d in fused_preds:
+        path = d["image_path"][0]
+
+        # label
+        if label_from == "gt_label" and "gt_label" in d and d["gt_label"] is not None:
+            gt = d["gt_label"]
+            # handle shapes like [1] or np array
+            if hasattr(gt, "__len__") and not isinstance(gt, (str, bytes)):
+                gt = int(np.array(gt).reshape(-1)[0])
+            else:
+                gt = int(gt)
+        else:
+            # fallback to filename convention
+            gt = 1 if anomalous_token in path.lower() else 0
+
+        # score from fused anomaly map
+        am = d["anomaly_map"]
+        score = image_score_from_anomaly_map(am, mode=score_mode)
+
+        y_true.append(gt)
+        y_score.append(score)
+        debug[path] = {"gt": gt, "img_score": score}
+
+    y_true = np.array(y_true, dtype=int)
+    y_score = np.array(y_score, dtype=float)
+
+    if len(np.unique(y_true)) < 2:
+        raise ValueError(f"Need both normal(0) and anomalous(1) images. Got: {np.unique(y_true)}")
+
+    auroc = roc_auc_score(y_true, y_score)
+    aupr  = average_precision_score(y_true, y_score)
 
     return auroc, aupr, debug, y_true, y_score
