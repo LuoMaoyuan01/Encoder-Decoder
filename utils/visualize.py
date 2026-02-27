@@ -6,6 +6,8 @@ import glob, os
 import re
 from sklearn.metrics import f1_score, roc_auc_score, average_precision_score
 from collections import defaultdict
+from anomalib.data.dataclasses import ImageBatch
+from PIL import Image
 
 def visualize_prediction_scores(predictions):
     "Visualize prediction scores as a histogram."
@@ -405,7 +407,50 @@ def compute_image_metrics_from_patch_preds(
 
     return auroc, aupr, debug, y_true, y_score
 
+def compute_q99_norm_from_patch_preds(
+    preds,
+    patch_score_mode="q999",
+    pool="top2",
+    method="NoOverlap",
+    q=0.99,
+):
+    """
+    Returns:
+      q99_norm: q-quantile of image scores among NORMAL images only
+      debug_scores: dict path -> {"gt":0/1, "img_score":float, "patch_scores":[...]}
+    """
+    grouped = defaultdict(list)
+    for p in preds:
+        grouped[get_image_key(p)].append(p)
+
+    norm_img_scores = []
+    debug = {}
+
+    for path, patch_list in grouped.items():
+        gt = get_image_label(patch_list[0])
+        patch_scores = [patch_score_from_anomaly_map(pp, mode=patch_score_mode, method=method) for pp in patch_list]
+        img_score = pool_patch_scores(patch_scores, pool=pool)
+        if img_score is None:
+            continue
+
+        debug[path] = {"gt": gt, "img_score": img_score, "patch_scores": patch_scores}
+        if gt == 0:
+            norm_img_scores.append(img_score)
+
+    if len(norm_img_scores) == 0:
+        return np.nan, debug
+
+    q99_norm = float(np.quantile(np.array(norm_img_scores, dtype=float), q))
+    return q99_norm, debug
+
 # -------------------------- MULTI SCALE SCORING HELPER FUNCTIONS -------------------------- #
+def get_gt_label_scalar(p):
+    gt = fetch(p, "gt_label")
+    if gt is None:
+        gt = fetch(p, "label")
+    if gt is None:
+        gt = fetch(p, "target")
+    return int(to_scalar(gt)) if gt is not None else None
 
 def image_score_from_anomaly_map(am, mode="q999"):
     """
@@ -483,3 +528,138 @@ def compute_image_metrics_from_fused_preds(
     aupr  = average_precision_score(y_true, y_score)
 
     return auroc, aupr, debug, y_true, y_score
+
+# --------------------------- COARSE PREDICTION HELPER FUNCTIONS --------------------------- #
+class CoarsePredictDataset(torch.utils.data.Dataset):
+    """
+    One FULL 512x512 image per item, returned as ImageBatch.
+    Label rule matches your patch dataset: filename contains 'anomalous' -> 1 else 0.
+    """
+    def __init__(self, img_dir: str, transform=None, H: int = 512, W: int = 512):
+        self.img_paths = sorted(glob.glob(os.path.join(img_dir, "*.*")))
+        if len(self.img_paths) == 0:
+            raise FileNotFoundError(f"No images found in {img_dir}")
+
+        self.transform = transform if transform is not None else T.ToTensor()
+        self.H = int(H)
+        self.W = int(W)
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx: int):
+        path = self.img_paths[idx]
+
+        # Ground-truth label from filename (your convention)
+        fname = os.path.basename(path).lower()
+        label = 1 if "anomalous" in fname else 0
+
+        pil = Image.open(path).convert("RGB")   # change to "L" if model trained grayscale
+        img = self.transform(pil)               # (C,H,W)
+
+        # Safety check
+        if img.shape[-2:] != (self.H, self.W):
+            raise ValueError(
+                f"Expected transformed image to be {self.H}x{self.W}, got {tuple(img.shape[-2:])} for {path}. "
+                f"Did you resize during training? If yes, add Resize((512,512)) here."
+            )
+
+        return ImageBatch(
+            image=img,                                  # FULL image
+            gt_mask=None,
+            gt_label=torch.tensor([label], dtype=torch.long),
+            image_path=[path],
+            mask_path=None,
+            explanation=["coarse"],
+        )
+    
+def compute_metrics_from_coarse_preds_selfscore(preds, score_mode="topk_mean", topk=200, q=0.99, remove_baseline=False):
+    y_true, y_score = [], []
+    debug = {}
+
+    for p in preds:
+        gt = get_gt_label_scalar(p)
+        if gt is None:
+            continue
+
+        sc = anomaly_map_to_score(p, mode=score_mode, topk=topk, remove_baseline=remove_baseline)
+
+        y_true.append(gt)
+        y_score.append(sc)
+
+        path = get_image_path_str(p)
+        if path is not None:
+            debug[path] = {"gt": int(gt), "score": float(sc)}
+
+    y_true = np.array(y_true, dtype=int)
+    y_score = np.array(y_score, dtype=float)
+
+    if len(y_true) == 0:
+        raise ValueError("No usable labels found. Check your dataset label rule.")
+
+    if len(np.unique(y_true)) < 2:
+        raise ValueError(f"Need both normal(0) and anomalous(1). Got labels: {np.unique(y_true)}")
+
+    auroc = roc_auc_score(y_true, y_score)
+    aupr  = average_precision_score(y_true, y_score)
+    q99_norm = float(np.quantile(y_score[y_true == 0], q))
+
+    meta = {
+        "n_used": int(len(y_true)),
+        "score_mode": score_mode,
+        "topk": int(topk),
+        "remove_baseline": bool(remove_baseline),
+        "score_min": float(y_score.min()),
+        "score_max": float(y_score.max()),
+        "score_mean": float(y_score.mean()),
+    }
+
+    return float(auroc), float(aupr), float(q99_norm), y_true, y_score, debug, meta
+
+def anomaly_map_to_score(pred, mode="topk_mean", topk=200, remove_baseline=False):
+    """
+    Compute your OWN image-level anomaly score from anomaly_map.
+
+    Recommended defaults for your case:
+      mode="topk_mean"  (more stable if anomaly_map saturates at 1)
+      topk=200
+
+    Other options:
+      mode="q999"       (99.9th percentile of pixels)
+      mode="max"        (often saturates; not recommended)
+
+    remove_baseline:
+      subtract median (ONLY if you see global bright offset in normals)
+    """
+    am = fetch(pred, "anomaly_map")
+    if am is None:
+        raise KeyError("Prediction has no 'anomaly_map' field.")
+
+    if torch.is_tensor(am):
+        am = am.detach().cpu()
+    else:
+        am = torch.tensor(am)
+
+    am = am.squeeze()
+    if am.ndim != 2:
+        raise ValueError(f"Expected anomaly_map 2D after squeeze, got {tuple(am.shape)}")
+
+    flat = am.flatten()
+
+    if remove_baseline:
+        flat = flat - flat.median()
+
+    if mode == "max":
+        return float(flat.max().item())
+
+    if mode.startswith("q"):
+        # "q999" -> 0.999, "q99" -> 0.99
+        q_str = mode[1:]
+        q = float(q_str) / (1000.0 if len(q_str) >= 3 else 100.0)
+        return float(torch.quantile(flat, q).item())
+
+    if mode == "topk_mean":
+        k = min(int(topk), flat.numel())
+        return float(torch.topk(flat, k).values.mean().item())
+
+    raise ValueError("mode must be one of: max, q999, q99, topk_mean")

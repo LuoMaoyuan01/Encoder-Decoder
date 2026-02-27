@@ -1,96 +1,189 @@
+import os, re, glob
+import numpy as np
+import pandas as pd
 import torch
-import torch.nn.functional as F
-from PIL import Image
-from torchvision import transforms
+import matplotlib.pyplot as plt
+from utils.split_into_patches import *
+from utils.visualize import *
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+from anomalib.engine import Engine
+from anomalib.data import Folder
+from anomalib.data.utils import ValSplitMode
 from anomalib.models.image import Dsr
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
 
-from utils.split_into_patches import split_into_n_patches
-from utils.stitch_patches import stitch_n_maps
-from utils.visualize import plot_full_anomaly_map
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CKPT_PATH = "weights/dsr-semicon-configA_p4-epoch=149.ckpt"
-TARGET_PATCH = 256
-
-# Load model
-model = Dsr.load_from_checkpoint(CKPT_PATH)
-model = model.to(DEVICE).eval()
-
-# ---------- HELPER FUNCTION ----------
-def get_field(out, name):
-    # dict-like
-    if hasattr(out, "__getitem__"):
+# ----------------- YOUR HELPERS (reuse exactly) -----------------
+def fetch(pred, key):
+    if hasattr(pred, "__getitem__"):
         try:
-            return out[name]
+            return pred[key]
         except Exception:
             pass
-    # attribute-like
-    return getattr(out, name, None)
+    return getattr(pred, key, None)
 
-# --------- INFERENCE FUNCTION ----------
-@torch.no_grad()
-def predict_full_image(model, img_1chw):
-    patches, coords = split_into_n_patches(img_1chw, patch=TARGET_PATCH, n=4)
-    patches = patches.to(DEVICE)
+def to_scalar(x):
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        x = x.detach().cpu()
+        return float(x.item()) if x.numel() == 1 else float(x.flatten()[0].item())
+    if isinstance(x, (list, tuple, np.ndarray)):
+        if len(x) == 0:
+            return None
+        return float(x[0])
+    return float(x)
 
-    out = model(patches)
+def get_image_path_str(p):
+    ip = fetch(p, "image_path")
+    if isinstance(ip, (list, tuple)) and len(ip) > 0:
+        return ip[0]
+    return ip
 
-    patch_maps = get_field(out, "anomaly_map")
-    flat = patch_maps.view(patch_maps.shape[0], -1)
-    k = max(1, int(0.01 * flat.shape[1]))
-    patch_scores = flat.topk(k=k, dim=1).values.mean(dim=1)
+def get_gt_label_scalar(p):
+    gt = fetch(p, "gt_label")
+    return int(to_scalar(gt)) if gt is not None else None
 
-    # patch_maps: (16,256,256) -> (16,128,128) since DSR upsamples internally to 256 x 256
-    if patch_maps.shape[-1] != 128:
-        patch_maps = F.interpolate(
-            patch_maps.unsqueeze(1),  # (16,1,256,256)
-            size=(TARGET_PATCH, TARGET_PATCH),
-            mode="bilinear",
-            align_corners=False
-        ).squeeze(1)  # (16,128,128)
+def get_pred_score_scalar(p):
+    # anomalib commonly uses pred_score; fallbacks included
+    s = fetch(p, "pred_score")
+    if s is None:
+        s = fetch(p, "score")
+    if s is None:
+        s = fetch(p, "image_score")
+    return to_scalar(s)
 
-    # Some builds may name it slightly differently:
-    if patch_maps is None:
-        patch_maps = get_field(out, "anomaly_maps")
-    if patch_scores is None:
-        patch_scores = get_field(out, "pred_scores")
+def collate_first(batch):
+    return batch[0]
 
-    if patch_maps is None or patch_scores is None:
-        # Debug: show what's available
-        avail = [a for a in dir(out) if "pred" in a or "anomaly" in a]
-        raise RuntimeError(f"Could not find anomaly_map/pred_score. Available related attrs: {avail}")
+transform = T.Compose([
+    # T.Resize((512, 512)),  # uncomment if you resized during training
+    T.ToTensor(),
+])
 
-    # patch_maps: (16, H, W) or (16,1,H,W)
-    if patch_maps.ndim == 4 and patch_maps.shape[1] == 1:
-        patch_maps = patch_maps[:, 0]  # -> (16,H,W)
-
-    patch_scores = patch_scores.detach().cpu().flatten()  # -> (16,)
-    patch_maps_cpu = patch_maps.detach().cpu()
-
-    full_map = stitch_n_maps(patch_maps, coords, out_size=512).detach().cpu()
-
-    image_score_max = float(patch_scores.max().item())
-    image_score_top3 = float(patch_scores.topk(k=3).values.mean().item())
-
-    return full_map, patch_maps_cpu, patch_scores, image_score_max, image_score_top3
+# ---------------- CONFIG ----------------
+img_dir = "data/temp_infer_configA_synthetic/images"
+CKPT_DIR  = "checkpoints"
+RUN_NAME  = "dsr-semicon-configA_p4"
+EVAL_BATCH_SIZE = 8
+Q = 0.99
 
 
-if __name__ == "__main__":
-    img_path = "data/temp_infer_configA/images/train_normal_06379.jpg"
+def parse_epoch(path: str) -> int:
+    # expects "...-{epoch:03d}.ckpt" OR "...epoch=123.ckpt"
+    base = os.path.basename(path)
+    m = re.search(r"-([0-9]{2,4})\.ckpt$", base)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"epoch=([0-9]{1,4})", base)
+    return int(m.group(1)) if m else -1
 
-    transform = transforms.Compose([
-        transforms.Resize((512, 512)),
-        transforms.ToTensor(),   # keep [0,1], no ImageNet normalization
-    ])
 
-    img = Image.open(img_path).convert("RGB")
-    img_tensor_1chw = transform(img).unsqueeze(0)  # (1,3,512,512)
+# ---------------- EVAL DATAMODULE ----------------
 
-    full_map, patch_maps, patch_scores, smax, stop3 = predict_full_image(model, img_tensor_1chw)
+engine = Engine(
+    logger = True,  # enable logging
+    accelerator="gpu",  # use available accelerator (GPU/CPU)
+    log_every_n_steps=10,
+)
 
-    # Visualize
-    plot_full_anomaly_map(img, full_map, title=f"Anomaly Map for {img_path}")
 
-    print("Patch scores:", patch_scores.tolist())
-    print("Image score (max):", smax)
-    print("Image score (top3 mean):", stop3)
+# ---------------- MAIN LOOP ----------------
+ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "*.ckpt")), key=parse_epoch)
+rows = []
+
+for ckpt in ckpts:
+    epoch = parse_epoch(ckpt)
+    if epoch < 0:
+        continue
+
+    MODEL_PATH = ckpt
+
+    model = Dsr.load_from_checkpoint(
+        MODEL_PATH,
+        evaluator=False
+    )
+
+    ds = PatchifyPredictDataset(img_dir, transform=transform, patch_size=256, stride=256)
+    dl = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate_first)
+
+    preds = engine.predict(model=model, dataloaders=dl, ckpt_path=MODEL_PATH)
+
+    # ---------------- TEST METRICS FROM PATCH PREDICTIONS ----------------
+    auroc, aupr, debug, y_true, y_score = compute_image_metrics_from_patch_preds(
+        preds,
+        patch_score_mode="q999",   # try: "q999" then "topk_mean" then "max"
+        pool="top2",               # try: "top2" then "max"
+        # method="Overlap"
+    )
+
+    y_true = np.array(y_true, dtype=int)
+    y_score = np.array(y_score, dtype=float)
+
+    q99_norm, _ = compute_q99_norm_from_patch_preds(
+        preds,
+        patch_score_mode="q999",
+        pool="top2",
+        method="NoOverlap",
+        q=0.99
+    )
+
+    rows.append({"epoch": epoch, "q99_norm": q99_norm, "AUROC": auroc, "AUPR": aupr})
+    print(f"epoch={epoch:03d}  q99_norm={q99_norm:.6f}  AUROC={auroc:.4f}  AUPR={aupr:.4f}")
+
+df = pd.DataFrame(rows).sort_values("epoch").reset_index(drop=True)
+out_csv = f"{RUN_NAME}_epoch_metrics.csv"
+df.to_csv(out_csv, index=False)
+print("Saved:", out_csv)
+
+
+# ---------------- PLOTS ----------------
+plt.figure()
+plt.plot(df["epoch"], df["q99_norm"])
+plt.xlabel("Epoch")
+plt.ylabel("q99(normal image score)")
+plt.title("Normal stability (q99) vs epoch")
+plt.show()
+
+plt.figure()
+plt.plot(df["epoch"], df["AUROC"])
+plt.xlabel("Epoch")
+plt.ylabel("Image AUROC")
+plt.title("Image AUROC vs epoch")
+plt.ylim(0, 1)
+plt.show()
+
+plt.figure()
+plt.plot(df["epoch"], df["AUPR"])
+plt.xlabel("Epoch")
+plt.ylabel("Image AUPR")
+plt.title("Image AUPR vs epoch")
+plt.ylim(0, 1)
+plt.show()
+
+# ---------------- COMBINED OVERLAY PLOT ----------------
+fig, ax1 = plt.subplots(figsize=(8, 5))
+
+# Left axis: AUROC + AUPR
+line1, = ax1.plot(df["epoch"], df["AUROC"], label="AUROC")
+line2, = ax1.plot(df["epoch"], df["AUPR"], label="AUPR")
+ax1.set_xlabel("Epoch")
+ax1.set_ylabel("AUROC / AUPR")
+ax1.set_ylim(0, 1)
+ax1.grid(True)
+
+# Right axis: q99_norm
+ax2 = ax1.twinx()
+line3, = ax2.plot(df["epoch"], df["q99_norm"], linestyle="--", label="q99_norm")
+ax2.set_ylabel("q99_norm")
+
+# Combine legends
+lines = [line1, line2, line3]
+labels = [l.get_label() for l in lines]
+ax1.legend(lines, labels, loc="best")
+
+plt.title("AUROC, AUPR and q99_norm vs Epoch (Overlay)")
+plt.tight_layout()
+plt.show()

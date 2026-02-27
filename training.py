@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import numpy as np
 import torch
 import yaml
 from anomalib.engine import Engine
@@ -14,13 +15,13 @@ from anomalib.models.image import Dsr
 with open("config.yaml", "r") as f:   # adjust path if config.yaml is elsewhere
     cfg = yaml.safe_load(f)
 
-DATA_ROOT = "data/configA_p4_stride50"
+DATA_ROOT = "data/configA"
 TRAINING_PATH = cfg.get("training_path", "data/train/normal")  # path to the training images
 # TRAINING_OUTPUT_PATH = cfg.get("training_output_path", "output/training")  # path to save training outputs
 CHECKPOINT_PATH = cfg.get("checkpoint_path", "checkpoints")  # path to save model checkpoints
 MODEL = cfg.get("model", "weights/dsr.ckpt")  # path to the trained model checkpoint
-EPOCHS = cfg.get("epochs", 150)
-BATCH_SIZE = cfg.get("batch_size", 16)
+EPOCHS = cfg.get("epochs", 90)
+BATCH_SIZE = cfg.get("batch_size", 8)
 LEARNING_RATE = cfg.get("learning_rate", 0.00005)
 IMAGE_SIZE = cfg.get("image_size", 512)
 
@@ -28,14 +29,14 @@ IMAGE_SIZE = cfg.get("image_size", 512)
 # ---------------- DATAMODULE ----------------
 # Keep transforms simple (no normalization) to satisfy DSR requirements.
 dm = Folder(
-    name="semicon_dsr_configA_p4_stride50",
+    name="semicon_dsr_configA",
     root=DATA_ROOT,
     normal_dir="train/normal",
     normal_test_dir="test/normal",
     abnormal_dir="test/anomalous",
     # normal-only validation split from training normals
     val_split_mode=ValSplitMode.FROM_TRAIN,
-    val_split_ratio=0.1,   # 10% of training images used for val
+    val_split_ratio=0.15,   # 10% of training images used for val
     train_batch_size=BATCH_SIZE,
     eval_batch_size=BATCH_SIZE,
     num_workers=2,
@@ -44,12 +45,12 @@ dm = Folder(
 # --------- Checkpoint callback ----------------
 checkpoint_cb = ModelCheckpoint(
     dirpath=CHECKPOINT_PATH,       # folder where ckpts are saved
-    filename="dsr-semicon-configA_p4-{epoch:02d}",  # name pattern
+    filename="dsr-semicon-configA-{epoch:02d}",  # name pattern
     monitor="train_loss_epoch",      # metric to track (from evaluator logs)
     mode="min",                      # higher AUROC is better
-    save_top_k=1,                    # save all checkpoint
+    save_top_k=-1,                    # save all checkpoint
     save_last=True,                  # ALSO save last.ckpt
-    every_n_epochs=5,               # save every 5 epochs
+    every_n_epochs=1,               # save every 5 epochs
 )
 
 # dm.setup()

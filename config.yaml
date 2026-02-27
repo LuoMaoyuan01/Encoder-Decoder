@@ -4,9 +4,9 @@ test_output_path : output/test/normal
 training_path : data/train/normal
 training_output_path : output/training
 checkpoint_path : checkpoints
-epochs : 150
-batch_size : 16
+epochs : 90
+batch_size : 8
 learning_rate : 0.00005
 threshold : 0.99995
 alpha : 0.7
-image_size : 256
+image_size : 512
