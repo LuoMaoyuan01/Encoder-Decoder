@@ -1,3 +1,4 @@
+import cv2
 import torch
 import torch.nn.functional as F
 from matplotlib import pyplot as plt
@@ -109,81 +110,108 @@ def coarse_preds_to_mapdict(coarse_preds):
     return out
 
 
-def fuse_stitched_with_coarse(fine_stitched, coarse_mapdict, out_size=512, threshold=0.49, update_pred_mask=True, beta=0.22, q_coarse = 0.90, q_fine_protect=0.995, show_suppression=False):
+def fuse_stitched_with_coarse(
+    fine_stitched,
+    coarse_mapdict,
+    out_size=512,
+    threshold=0.49,
+    update_pred_mask=True,
+    beta=0.45,               # used as residual strength (alpha)
+    q_coarse=0.90,           # used only if Tcoarse is None
+    q_fine_protect=0.95,     # kept for compatibility (not required now)
+    show_suppression=False,
+    Tcoarse=None,            # 🔥 NEW: dataset-level coarse threshold (recommended)
+    k=12.0,                  # gate sharpness
+    blur_sigma=1.2,
+    use_residual=True,
+):
     """
-    Fuse stitched fine anomaly maps with coarse anomaly maps.
+    Improved multi-scale suppression (stable, calibrated).
 
-    For each image, the function:
-
-    1) Takes the stitched fine anomaly map (full resolution).
-    2) Resizes the corresponding coarse anomaly map to the same resolution if needed.
-    3) Applies structure-aware suppression, where strong coarse responses attenuate
-       the fine anomaly scores while protecting the strongest fine activations.
-    4) Returns fused predictions in the same format as the stitched inputs.
-
-    The output anomaly map preserves defect-sensitive fine responses while reducing
-    coarse-induced structural artifacts.
+    Keeps original naming conventions.
     """
+
     fused = []
 
     for d in fine_stitched:
         path = d["image_path"][0]
 
-        # fine anomaly map (numpy HxW) -> torch (1,H,W)
         fine_am = d["anomaly_map"]
         if fine_am is None:
             fused.append(d)
             continue
 
-        fine_t = torch.tensor(fine_am, dtype=torch.float32).unsqueeze(0)  # (1,512,512)
+        # Convert fine map
+        A_f = torch.tensor(fine_am, dtype=torch.float32)
 
-        # coarse anomaly map -> upsample to (1,512,512)
-        coarse_t = coarse_mapdict[path]  # (1,256,256) typically
-        if coarse_t.ndim == 2:
-            coarse_t = coarse_t.unsqueeze(0)
+        # Get coarse map
+        coarse_t = coarse_mapdict[path]
 
+        if coarse_t.ndim == 3:
+            coarse_t = coarse_t.squeeze(0)
+
+        # Resize coarse
         if coarse_t.shape[-2:] != (out_size, out_size):
             coarse_up = F.interpolate(
-                coarse_t.unsqueeze(0), size=(out_size, out_size),
-                mode="bilinear", align_corners=False
-            )[0]
+                coarse_t.unsqueeze(0).unsqueeze(0),
+                size=(out_size, out_size),
+                mode="bilinear",
+                align_corners=False
+            )[0, 0]
         else:
             coarse_up = coarse_t
 
-        # --- Structure suppression fusion (fine-protect variant) ---
-        use_mask = True
+        A_c = coarse_up.float()
 
-        A_f = fine_t.squeeze(0)     # (512,512)
-        A_c = coarse_up.squeeze(0)  # (512,512)
-
-        # --- NEW: define protection & suppression masks ---
-
-        coarse_strong = A_c > torch.quantile(A_c.flatten(), q_coarse)
-        fine_strong   = A_f > torch.quantile(A_f.flatten(), q_fine_protect)
-
-        supp_mask = coarse_strong & (~fine_strong)
-
-        # --- Suppression ---
-        if use_mask:
-            A_out = torch.clamp(A_f - beta * supp_mask.float() * A_c, min=0.0)
+        # --------------------------------------------------
+        # 1️⃣ Smooth coarse map (spatial coherence)
+        # --------------------------------------------------
+        if blur_sigma > 0:
+            A_c_np = A_c.detach().cpu().numpy()
+            A_c_np = cv2.GaussianBlur(A_c_np, (5, 5), blur_sigma)
+            A_c_s = torch.tensor(A_c_np, dtype=torch.float32, device=A_c.device)
         else:
-            A_out = torch.clamp(A_f - beta * A_c, min=0.0)
+            A_c_s = A_c
 
-        final_t = A_out.unsqueeze(0)  # back to (1,512,512)
+        # --------------------------------------------------
+        # 2️⃣ Determine coarse threshold
+        # --------------------------------------------------
+        if Tcoarse is None:
+            tc = torch.quantile(A_c_s.flatten(), q_coarse)
+        else:
+            tc = torch.tensor(Tcoarse, dtype=torch.float32, device=A_c.device)
 
-        # Optional debug: what got removed
+        # Soft gate
+        G = torch.sigmoid(k * (A_c_s - tc))
+
+        # --------------------------------------------------
+        # 3️⃣ Residual suppression (fine - beta * coarse)
+        # --------------------------------------------------
+        if use_residual:
+            A_f_res = torch.relu(A_f - beta * A_c_s)
+        else:
+            A_f_res = A_f
+
+        # --------------------------------------------------
+        # 4️⃣ Fusion (coarse dominant)
+        # --------------------------------------------------
+        A_out = torch.maximum(A_c, A_f_res * G)
+
         if show_suppression:
             delta = (A_f - A_out).clamp_min(0)
-            plt.figure(); plt.imshow(delta.detach().cpu(), cmap="inferno")
-            plt.colorbar(); plt.title("Suppression Removed (fine - final)")
-            plt.axis("off"); plt.show()
+            plt.figure()
+            plt.imshow(delta.detach().cpu(), cmap="inferno")
+            plt.colorbar()
+            plt.title("Suppression Removed (fine - final)")
+            plt.axis("off")
+            plt.show()
 
-        # write back in same format your plotter expects: numpy (H,W)
         new_d = dict(d)
-        new_d["anomaly_map"] = final_t.squeeze(0).numpy()
+        new_d["anomaly_map"] = A_out.detach().cpu().numpy()
 
         if update_pred_mask:
-            new_d["pred_mask"] = (final_t.squeeze(0) > threshold).numpy()
+            new_d["pred_mask"] = (A_out > threshold).detach().cpu().numpy()
 
         fused.append(new_d)
+
     return fused
