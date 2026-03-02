@@ -115,7 +115,7 @@ for ckpt in ckpts:
     auroc, aupr, debug, y_true, y_score = compute_image_metrics_from_patch_preds(
         preds,
         patch_score_mode="q999",   # try: "q999" then "topk_mean" then "max"
-        pool="top2",               # try: "top2" then "max"
+        pool="max",               # try: "top2" then "max"
         # method="Overlap"
     )
 
@@ -125,7 +125,7 @@ for ckpt in ckpts:
     q99_norm, _ = compute_q99_norm_from_patch_preds(
         preds,
         patch_score_mode="q999",
-        pool="top2",
+        pool="max",
         method="NoOverlap",
         q=0.99
     )
