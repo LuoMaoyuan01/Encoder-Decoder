@@ -15,21 +15,21 @@ from anomalib.models.image import Dsr
 with open("config.yaml", "r") as f:   # adjust path if config.yaml is elsewhere
     cfg = yaml.safe_load(f)
 
-DATA_ROOT = "data/configA_p16"
+DATA_ROOT = "data/configA_p4"
 TRAINING_PATH = cfg.get("training_path", "data/train/normal")  # path to the training images
 # TRAINING_OUTPUT_PATH = cfg.get("training_output_path", "output/training")  # path to save training outputs
 CHECKPOINT_PATH = cfg.get("checkpoint_path", "checkpoints")  # path to save model checkpoints
 MODEL = cfg.get("model", "weights/dsr.ckpt")  # path to the trained model checkpoint
-EPOCHS = cfg.get("epochs", 120)
+EPOCHS = cfg.get("epochs", 100)
 BATCH_SIZE = cfg.get("batch_size", 8)
 LEARNING_RATE = cfg.get("learning_rate", 0.00005)
-IMAGE_SIZE = cfg.get("image_size", 128)
+IMAGE_SIZE = cfg.get("image_size", 256)
 
 
 # ---------------- DATAMODULE ----------------
 # Keep transforms simple (no normalization) to satisfy DSR requirements.
 dm = Folder(
-    name="semicon_dsr_configA_p16",
+    name="semicon_dsr_configA_p4",
     root=DATA_ROOT,
     normal_dir="train/normal",
     normal_test_dir="test/normal",
@@ -45,7 +45,7 @@ dm = Folder(
 # --------- Checkpoint callback ----------------
 checkpoint_cb = ModelCheckpoint(
     dirpath=CHECKPOINT_PATH,       # folder where ckpts are saved
-    filename="dsr-semicon-configA-p16-{epoch:02d}",  # name pattern
+    filename="dsr-semicon-configA-p4-{epoch:02d}",  # name pattern
     monitor="train_loss_epoch",      # metric to track (from evaluator logs)
     mode="min",                      # higher AUROC is better
     save_top_k=-1,                    # save all checkpoint
