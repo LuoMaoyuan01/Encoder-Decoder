@@ -371,6 +371,33 @@ def pool_patch_scores(scores, pool="max"):
         return float(np.mean(scores))
     raise ValueError("pool must be one of: max, top2, mean")
 
+def compute_avg_q99_normalized(preds, q_norm=0.95):
+    q99_list = []
+    normal_q99 = []
+
+    # First pass: compute q99 for all
+    for p in preds:
+        am = p["anomaly_map"]
+        if am is None:
+            continue
+
+        am = np.asarray(am)
+        q99 = np.quantile(am, 0.99)
+
+        q99_list.append(q99)
+
+        gt = get_image_label(p)
+        if gt == 0:
+            normal_q99.append(q99)
+
+    # Compute normalization factor from NORMAL images
+    T_normal = np.quantile(normal_q99, q_norm)
+
+    # Normalize all q99 scores
+    q99_norm = [q / (T_normal + 1e-8) for q in q99_list]
+
+    return float(np.mean(q99_norm))
+
 def compute_image_metrics_from_patch_preds(
     preds,
     patch_score_mode="q999",   # 'q999' recommended if max saturates
